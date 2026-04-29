@@ -79,16 +79,37 @@ class ScraperError(StartupAuditorError):
             return AnalysisResult(success=False, errors=[e])
     """
 
-    def __init__(self, message: str, recovery_hint: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        recovery_hint: str | None = None,
+        max_retries: int | None = None,
+        retries_attempted: int | None = None,
+        last_response_status: int | None = None,
+    ):
         """Initialize ScraperError with actionable message.
 
         Args:
             message: Description of the error
             recovery_hint: Optional hint for how to fix the issue
+            max_retries: Maximum retries that were attempted (if applicable)
+            retries_attempted: Number of retries actually attempted (if applicable)
+            last_response_status: HTTP status code from last response (if applicable)
         """
         self.message = message
         self.recovery_hint = recovery_hint or self._default_recovery_hint()
-        super().__init__(f"{message}\n\nRecovery: {self.recovery_hint}")
+        self.max_retries = max_retries
+        self.retries_attempted = retries_attempted
+        self.last_response_status = last_response_status
+
+        # Build detailed error message with retry info if available
+        error_msg = f"{message}"
+        if retries_attempted is not None and max_retries is not None:
+            error_msg += f" (after {retries_attempted}/{max_retries} retries)"
+        if last_response_status is not None:
+            error_msg += f" [Status: {last_response_status}]"
+
+        super().__init__(f"{error_msg}\n\nRecovery: {self.recovery_hint}")
 
     def _default_recovery_hint(self) -> str:
         """Provide default recovery guidance for scraper errors."""

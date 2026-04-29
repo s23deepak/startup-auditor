@@ -2,16 +2,18 @@
 
 Uses Playwright to scrape dynamic JavaScript-heavy websites.
 Supports headless browsing, network call interception, and graceful error handling.
+Includes rate limiting with exponential backoff and retry logic.
 """
 
 import asyncio
 from html.parser import HTMLParser
 from typing import Any
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Response
 
 from startup_auditor.exceptions import ScraperError
 from startup_auditor.scrapers.base import BaseScraper, ScrapedData
+from startup_auditor.scrapers.rate_limiter import RateLimiter, RetryResult
 
 
 class MetaDescriptionParser(HTMLParser):
@@ -36,6 +38,7 @@ class PlaywrightScraper(BaseScraper):
     - Headless browser automation
     - JavaScript rendering support
     - Network call interception (future)
+    - Rate limiting with exponential backoff
     - Graceful error handling
 
     Usage:
@@ -48,6 +51,8 @@ class PlaywrightScraper(BaseScraper):
         headless: bool = True,
         timeout: int = 30000,
         wait_for_network_idle: bool = False,
+        max_retries: int = 3,
+        verbose: bool = False,
     ) -> None:
         """Initialize Playwright scraper.
 
@@ -55,13 +60,18 @@ class PlaywrightScraper(BaseScraper):
             headless: Run browser in headless mode
             timeout: Page load timeout in milliseconds
             wait_for_network_idle: Wait for network to idle (slower but more complete)
+            max_retries: Maximum retry attempts for rate limiting (default: 3)
+            verbose: Enable verbose logging for retry attempts
         """
         self.headless = headless
         self.timeout = timeout
         self.wait_for_network_idle = wait_for_network_idle
+        self.max_retries = max_retries
+        self.verbose = verbose
+        self.rate_limiter = RateLimiter(max_retries=max_retries)
 
     async def scrape_async(self, url: str) -> ScrapedData:
-        """Scrape a website asynchronously.
+        """Scrape a website asynchronously with retry logic.
 
         Args:
             url: The URL to scrape
@@ -70,9 +80,11 @@ class PlaywrightScraper(BaseScraper):
             ScrapedData containing HTML, title, and metadata
 
         Raises:
-            ScraperError: If scraping fails
+            ScraperError: If scraping fails after all retries
         """
-        try:
+
+        async def _scrape_once() -> ScrapedData:
+            """Inner scrape function for retry wrapper."""
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.launch(headless=self.headless)
                 context = await browser.new_context(
@@ -87,8 +99,21 @@ class PlaywrightScraper(BaseScraper):
                 # Set timeout
                 page.set_default_timeout(self.timeout)
 
-                # Navigate to page
-                await page.goto(url, wait_until="domcontentloaded")
+                # Navigate to page with retry handling
+                response = await page.goto(url, wait_until="domcontentloaded")
+
+                # Check for 429 rate limit
+                if response and response.status == 429:
+                    retry_after = response.headers.get("retry-after")
+                    if retry_after:
+                        raise ScraperError(
+                            f"Rate limited (429). Retry-After: {retry_after}",
+                            recovery_hint="Will retry with exponential backoff.",
+                        )
+                    raise ScraperError(
+                        "Rate limited (429).",
+                        recovery_hint="Will retry with exponential backoff.",
+                    )
 
                 # Wait for network idle if requested
                 if self.wait_for_network_idle:
@@ -110,22 +135,44 @@ class PlaywrightScraper(BaseScraper):
                     meta_description=meta_description,
                 )
 
-        except TimeoutError as e:
+        def _on_retry(attempt: int, error: Exception, delay: float) -> None:
+            """Callback for retry events."""
+            if self.verbose:
+                print(f"Retry {attempt + 1}/{self.max_retries}: {type(error).__name__} - Waiting {delay:.1f}s")
+
+        # Execute with retry logic
+        result = await self.rate_limiter.execute_with_retry(
+            _scrape_once,
+            on_retry=_on_retry,
+        )
+
+        if result.success:
+            if result.retries_attempted > 0 and self.verbose:
+                print(f"Scrape succeeded after {result.retries_attempted} retries")
+            return result.result
+        else:
+            # All retries exhausted
+            if self.verbose:
+                print(f"Rate limited. Falling back to external sources.")
+
+            # Check if it was a rate limiting issue
+            if result.error and "429" in str(result.error) or isinstance(result.error, TimeoutError):
+                raise ScraperError(
+                    f"Failed to scrape {url} after {result.retries_attempted} retries: {str(result.error)}",
+                    recovery_hint=(
+                        "Rate limited. Falling back to external sources.\n"
+                        "Consider reducing request frequency or using cached data."
+                    ),
+                ) from result.error
+
+            # General scrape failure
             raise ScraperError(
-                f"Timeout while loading {url}",
-                recovery_hint=(
-                    "The website may be slow or blocking automated requests.\n"
-                    "Try increasing the timeout or check if the URL is accessible."
-                ),
-            ) from e
-        except Exception as e:
-            raise ScraperError(
-                f"Failed to scrape {url}: {str(e)}",
+                f"Failed to scrape {url} after {result.retries_attempted} retries: {str(result.error)}",
                 recovery_hint=(
                     "Check that the URL is valid and accessible.\n"
                     "Some websites block automated browsers - try a different URL."
                 ),
-            ) from e
+            ) from result.error
 
     async def _extract_meta_description(self, page: Any) -> str:
         """Extract meta description from page.

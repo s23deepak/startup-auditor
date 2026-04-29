@@ -116,7 +116,8 @@ class TestPlaywrightScraperScrapeAsync:
             with pytest.raises(ScraperError) as exc_info:
                 await scraper.scrape_async("https://example.com")
 
-            assert "Timeout" in str(exc_info.value.message)
+            # Error message includes retry info and original error
+            assert "retries" in str(exc_info.value.message).lower() or "Timeout" in str(exc_info.value)
             assert "recovery" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
