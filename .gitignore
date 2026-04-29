@@ -60,4 +60,6 @@ _bmad-output/
 _bmad/
 node_modules/
 .claude/
+.agent/
+.agents/
 _bmad/custom/*.user.toml
