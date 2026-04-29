@@ -57,3 +57,7 @@ Thumbs.db
 
 # Project specific
 _bmad-output/
+_bmad/
+node_modules/
+.claude/
+_bmad/custom/*.user.toml
