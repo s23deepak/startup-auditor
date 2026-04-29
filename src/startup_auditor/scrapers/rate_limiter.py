@@ -55,6 +55,10 @@ class RateLimiter:
             max_retries: Maximum number of retry attempts (default: 3)
             base_delay: Base delay in seconds for backoff calculation (default: 1.0)
         """
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
+        if base_delay <= 0:
+            raise ValueError("base_delay must be > 0")
         self.max_retries = max_retries
         self.base_delay = base_delay
 
@@ -80,12 +84,17 @@ class RateLimiter:
             header_value: Value from Retry-After header
 
         Returns:
-            Seconds to wait, capped at 10.0 seconds
+            Seconds to wait, capped at 10.0 seconds. Returns 0.0 for empty/invalid input.
         """
+        if not header_value:
+            return 0.0
         try:
-            # Integer seconds format
-            return min(int(header_value), 10.0)
-        except ValueError:
+            # Integer seconds format - handle negative values
+            val = int(header_value)
+            if val < 0:
+                return self.calculate_backoff(0)
+            return min(val, 10.0)
+        except (ValueError, OverflowError):
             # HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
             try:
                 retry_date = parsedate_to_datetime(header_value)
@@ -109,15 +118,19 @@ class RateLimiter:
         if status_code == 429:
             return True
 
-        # Connection errors that are likely temporary
-        error_name = type(error).__name__.lower()
-        retryable_errors = [
-            "timeout",
-            "connection",
-            "dns",
-        ]
+        # Check for ScraperError with 429 status
+        if hasattr(error, 'last_response_status') and error.last_response_status == 429:
+            return True
 
-        return any(name in error_name for name in retryable_errors)
+        # Use isinstance for standard exception types (more robust than string matching)
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+            return True
+
+        # String matching as fallback for other connection-related errors
+        error_name = type(error).__name__.lower()
+        retryable_error_patterns = ["timeout", "connection", "dns"]
+
+        return any(pattern in error_name for pattern in retryable_error_patterns)
 
     async def execute_with_retry(
         self,
@@ -147,6 +160,9 @@ class RateLimiter:
                     result=result,
                     retries_attempted=attempt,
                 )
+            except asyncio.CancelledError:
+                # Re-raise cancellation immediately - don't swallow
+                raise
             except Exception as e:
                 last_error = e
 
@@ -162,17 +178,23 @@ class RateLimiter:
                 if attempt == self.max_retries:
                     break
 
-                # Call on_retry callback if provided
-                if on_retry:
-                    on_retry(attempt, e, 0)  # delay not known yet
-
-                # Calculate delay and sleep
+                # Calculate delay first, then call callback with actual delay
                 delay = self.calculate_backoff(attempt)
+
+                # Call on_retry callback if provided (with actual delay value)
+                if on_retry:
+                    try:
+                        on_retry(attempt, e, delay)
+                    except Exception:
+                        # Don't let callback exceptions abort the retry loop
+                        pass
+
+                # Sleep with the calculated delay
                 await asyncio.sleep(delay)
 
         # All retries exhausted
         return RetryResult(
             success=False,
             error=last_error,
-            retries_attempted=self.max_retries,
+            retries_attempted=attempt,  # Use actual attempt count, not max_retries
         )

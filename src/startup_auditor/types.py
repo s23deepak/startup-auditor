@@ -36,9 +36,11 @@ class AnalysisContext:
         """Reduce confidence score by a specified amount.
 
         Args:
-            amount: Amount to reduce (0.0-1.0)
+            amount: Amount to reduce (0.0-1.0). Negative amounts are treated as 0.
             reason: Optional reason for the reduction
         """
+        # Clamp amount to valid range [0.0, 1.0]
+        amount = max(0.0, min(amount, 1.0))
         self.confidence = max(0.0, self.confidence - amount)
         if self.verbose and reason:
             print(f"Confidence reduced by {amount:.1f}: {reason}")
