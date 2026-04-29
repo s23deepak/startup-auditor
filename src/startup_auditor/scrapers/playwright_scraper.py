@@ -14,6 +14,7 @@ from playwright.async_api import async_playwright, Response
 from startup_auditor.exceptions import ScraperError
 from startup_auditor.scrapers.base import BaseScraper, ScrapedData
 from startup_auditor.scrapers.rate_limiter import RateLimiter, RetryResult
+from startup_auditor.scrapers.network_interceptor import NetworkInterceptor, detect_wafer_pass
 
 
 class MetaDescriptionParser(HTMLParser):
@@ -86,6 +87,7 @@ class PlaywrightScraper(BaseScraper):
         async def _scrape_once() -> ScrapedData:
             """Inner scrape function for retry wrapper."""
             browser = None
+            network_interceptor = NetworkInterceptor()
             try:
                 async with async_playwright() as playwright:
                     browser = await playwright.chromium.launch(headless=self.headless)
@@ -100,6 +102,10 @@ class PlaywrightScraper(BaseScraper):
 
                     # Set timeout
                     page.set_default_timeout(self.timeout)
+
+                    # Set up network interception
+                    page.on("request", network_interceptor.on_request)
+                    page.on("response", network_interceptor.on_response)
 
                     # Navigate to page
                     response = await page.goto(url, wait_until="domcontentloaded")
@@ -124,6 +130,9 @@ class PlaywrightScraper(BaseScraper):
                     if self.wait_for_network_idle:
                         await page.wait_for_load_state("networkidle")
 
+                    # Finalize network interception (deduplicate and classify)
+                    network_interceptor.finalize()
+
                     # Extract content
                     html = await page.content()
                     title = await page.title()
@@ -131,11 +140,15 @@ class PlaywrightScraper(BaseScraper):
                     # Extract meta description
                     meta_description = await self._extract_meta_description(page)
 
+                    # Get network calls
+                    network_calls = [call.url for call in network_interceptor.get_network_calls()]
+
                     return ScrapedData(
                         url=url,
                         html=html,
                         title=title,
                         meta_description=meta_description,
+                        network_calls=network_calls,
                     )
             finally:
                 # Ensure browser is always closed, even on error
